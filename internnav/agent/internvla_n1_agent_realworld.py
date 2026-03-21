@@ -17,7 +17,10 @@ from collections import OrderedDict
 from PIL import Image
 from transformers import AutoProcessor
 
-from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.basemodel.internvla_n1.internvla_n1 import (
+    InternVLAN1ForCausalLM,
+    InternVLAN1ModelConfig,
+)
 from internnav.model.utils.vln_utils import S2Output, split_and_clean, traj_to_actions
 
 DEFAULT_IMAGE_TOKEN = "<image>"
@@ -27,9 +30,19 @@ class InternVLAN1AsyncAgent:
     def __init__(self, args):
         self.device = torch.device(args.device)
         self.save_dir = "test_data/" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.makedirs(self.save_dir, exist_ok=True)
         print(f"args.model_path{args.model_path}")
+        config = InternVLAN1ModelConfig.from_pretrained(args.model_path)
+        if not hasattr(config, 'system1'):
+            if getattr(config, 'navdp', None) is not None:
+                config.system1 = 'navdp_async' if float(getattr(config, 'navdp_version', 0.0)) > 0 else 'navdp'
+            else:
+                config.system1 = 'nextdit_async'
+        config.model_type = 'internvla_n1'
+
         self.model = InternVLAN1ForCausalLM.from_pretrained(
             args.model_path,
+            config=config,
             torch_dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
             device_map={"": self.device},

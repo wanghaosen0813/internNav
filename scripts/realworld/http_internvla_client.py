@@ -1,3 +1,4 @@
+import argparse
 import copy
 import io
 import json
@@ -10,28 +11,33 @@ from enum import Enum
 import numpy as np
 import rclpy
 import requests
+from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
+from message_filters import ApproximateTimeSynchronizer, Subscriber
 from nav_msgs.msg import Odometry
 from PIL import Image as PIL_Image
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
+
+from controllers import Mpc_controller, PID_controller
+from thread_utils import ReadWriteLock
+
+DEFAULT_INSTRUCTION = (
+    "Turn around and walk out of this office. Turn towards your slight right at the chair. "
+    "Move forward to the walkway and go near the red bin. You can see an open door on your right side, "
+    "go inside the open door. Stop at the computer monitor"
+)
 
 frame_data = {}
 frame_idx = 0
-# user-specific
-from controllers import Mpc_controller, PID_controller
-from cv_bridge import CvBridge
-from message_filters import ApproximateTimeSynchronizer, Subscriber
-from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from thread_utils import ReadWriteLock
 
 
 class ControlMode(Enum):
-    PID_Mode = 1
-    MPC_Mode = 2
+    PID_MODE = 1
+    MPC_MODE = 2
 
 
-# global variable
 policy_init = True
 mpc = None
 pid = PID_controller(Kp_trans=2.0, Kd_trans=0.0, Kp_yaw=1.5, Kd_yaw=0.0, max_v=0.6, max_w=0.5)
@@ -40,8 +46,9 @@ first_running_time = 0.0
 last_pixel_goal = None
 last_s2_step = -1
 manager = None
-current_control_mode = ControlMode.MPC_Mode
+current_control_mode = ControlMode.MPC_MODE
 trajs_in_world = None
+
 
 desired_v, desired_w = 0.0, 0.0
 rgb_depth_rw_lock = ReadWriteLock()
@@ -49,9 +56,29 @@ odom_rw_lock = ReadWriteLock()
 mpc_rw_lock = ReadWriteLock()
 
 
-def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0.0.1:5801/eval_dual'):
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--server_url', type=str, default='http://127.0.0.1:5801/eval_dual')
+    parser.add_argument('--instruction', type=str, default=DEFAULT_INSTRUCTION)
+    parser.add_argument('--rgb_topic', type=str, default='/camera/color/image_raw')
+    parser.add_argument('--depth_topic', type=str, default='/camera/depth/image_raw')
+    parser.add_argument('--odom_topic', type=str, default='/odom')
+    parser.add_argument('--cmd_vel_topic', type=str, default='/cmd_vel')
+    parser.add_argument('--sync_queue_size', type=int, default=5)
+    parser.add_argument('--sync_slop', type=float, default=0.1)
+    parser.add_argument('--turn_in_place_omega', type=float, default=1.0)
+    parser.add_argument('--turn_in_place_linear_threshold', type=float, default=0.05)
+    parser.add_argument('--turn_in_place_angular_deadband', type=float, default=0.02)
+    return parser.parse_args()
+
+
+def dual_sys_eval(image_bytes, depth_bytes, url, instruction):
     global policy_init, http_idx, first_running_time
-    data = {"reset": policy_init, "idx": http_idx}
+    data = {
+        'reset': policy_init,
+        'idx': http_idx,
+        'instruction': instruction,
+    }
     json_data = json.dumps(data)
 
     policy_init = False
@@ -61,11 +88,12 @@ def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0
     }
     start = time.time()
     response = requests.post(url, files=files, data={'json': json_data}, timeout=100)
-    print(f"response {response.text}")
+    response.raise_for_status()
+    print(f'response {response.text}')
     http_idx += 1
     if http_idx == 0:
         first_running_time = time.time()
-    print(f"idx: {http_idx} after http {time.time() - start}")
+    print(f'idx: {http_idx} after http {time.time() - start}')
 
     return json.loads(response.text)
 
@@ -74,7 +102,7 @@ def control_thread():
     global desired_v, desired_w
     while True:
         global current_control_mode
-        if current_control_mode == ControlMode.MPC_Mode:
+        if current_control_mode == ControlMode.MPC_MODE:
             odom_rw_lock.acquire_read()
             odom = manager.odom.copy() if manager.odom else None
             odom_rw_lock.release_read()
@@ -85,7 +113,7 @@ def control_thread():
 
                 desired_v, desired_w = v, w
                 manager.move(v, 0.0, w)
-        elif current_control_mode == ControlMode.PID_Mode:
+        elif current_control_mode == ControlMode.PID_MODE:
             odom_rw_lock.acquire_read()
             odom = manager.odom.copy() if manager.odom else None
             odom_rw_lock.release_read()
@@ -108,7 +136,7 @@ def planning_thread():
 
     while True:
         start_time = time.time()
-        DESIRED_TIME = 0.3
+        desired_time = 0.3
         time.sleep(0.05)
 
         if not manager.new_image_arrived:
@@ -124,15 +152,12 @@ def planning_thread():
         rgb_depth_rw_lock.release_read()
         odom_rw_lock.acquire_read()
         min_diff = 1e10
-        # time_diff = 1e10
         odom_infer = None
         for odom in manager.odom_queue:
             diff = abs(odom[0] - rgb_time)
             if diff < min_diff:
                 min_diff = diff
                 odom_infer = copy.deepcopy(odom[1])
-                # time_diff = odom[0] - rgb_time
-        # odom_time = manager.odom_timestamp
         odom_rw_lock.release_read()
 
         if odom_infer is not None and rgb_bytes is not None and depth_bytes is not None:
@@ -144,16 +169,15 @@ def planning_thread():
             }
             if len(frame_data) > 100:
                 del frame_data[min(frame_data.keys())]
-            response = dual_sys_eval(rgb_bytes, depth_bytes, None)
+            response = dual_sys_eval(rgb_bytes, depth_bytes, manager.server_url, manager.instruction)
 
             global current_control_mode
-            traj_len = 0.0
             if 'trajectory' in response:
                 trajectory = response['trajectory']
                 trajs_in_world = []
                 odom = odom_infer
                 traj_len = np.linalg.norm(trajectory[-1][:2])
-                print(f"traj len {traj_len}")
+                print(f'traj len {traj_len}')
                 for i, traj in enumerate(trajectory):
                     if i < 3:
                         continue
@@ -170,7 +194,7 @@ def planning_thread():
                     w_P = (w_T_b @ (np.array([traj[0], traj[1], 0.0, 1.0])).T)[:2]
                     trajs_in_world.append(w_P)
                 trajs_in_world = np.array(trajs_in_world)
-                print(f"{time.time()} update traj")
+                print(f'{time.time()} update traj')
 
                 manager.last_trajs_in_world = trajs_in_world
                 mpc_rw_lock.acquire_write()
@@ -181,48 +205,50 @@ def planning_thread():
                     mpc.update_ref_traj(np.array(trajs_in_world))
                 manager.request_cnt += 1
                 mpc_rw_lock.release_write()
-                current_control_mode = ControlMode.MPC_Mode
+                current_control_mode = ControlMode.MPC_MODE
             elif 'discrete_action' in response:
                 actions = response['discrete_action']
                 if actions != [5] and actions != [9]:
                     manager.incremental_change_goal(actions)
-                    current_control_mode = ControlMode.PID_Mode
+                    current_control_mode = ControlMode.PID_MODE
         else:
             print(
-                f"skip planning. odom_infer: {odom_infer is not None} rgb_bytes: {rgb_bytes is not None} depth_bytes: {depth_bytes is not None}"
+                f'skip planning. odom_infer: {odom_infer is not None} rgb_bytes: {rgb_bytes is not None} depth_bytes: {depth_bytes is not None}'
             )
             time.sleep(0.1)
 
-        time.sleep(max(0, DESIRED_TIME - (time.time() - start_time)))
+        time.sleep(max(0, desired_time - (time.time() - start_time)))
 
 
-class Go2Manager(Node):
-    def __init__(self):
-        super().__init__('go2_manager')
-
-        rgb_down_sub = Subscriber(self, Image, "/camera/camera/color/image_raw")
-        depth_down_sub = Subscriber(self, Image, "/camera/camera/aligned_depth_to_color/image_raw")
+class LimoManager(Node):
+    def __init__(self, args):
+        super().__init__('limo_manager')
+        self.server_url = args.server_url
+        self.instruction = args.instruction
+        self.turn_in_place_omega = args.turn_in_place_omega
+        self.turn_in_place_linear_threshold = args.turn_in_place_linear_threshold
+        self.turn_in_place_angular_deadband = args.turn_in_place_angular_deadband
 
         qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
 
-        self.syncronizer = ApproximateTimeSynchronizer([rgb_down_sub, depth_down_sub], 1, 0.1)
-        self.syncronizer.registerCallback(self.rgb_depth_down_callback)
-        self.odom_sub = self.create_subscription(Odometry, "/odom_bridge", self.odom_callback, qos_profile)
+        rgb_sub = Subscriber(self, Image, args.rgb_topic, qos_profile=qos_profile)
+        depth_sub = Subscriber(self, Image, args.depth_topic, qos_profile=qos_profile)
+        self.syncronizer = ApproximateTimeSynchronizer([rgb_sub, depth_sub], args.sync_queue_size, args.sync_slop)
+        self.syncronizer.registerCallback(self.rgb_depth_callback)
+        self.odom_sub = self.create_subscription(Odometry, args.odom_topic, self.odom_callback, qos_profile)
+        self.control_pub = self.create_publisher(Twist, args.cmd_vel_topic, 5)
 
-        # publisher
-        self.control_pub = self.create_publisher(Twist, '/cmd_vel_bridge', 5)
-
-        # class member variable
         self.cv_bridge = CvBridge()
         self.rgb_image = None
         self.rgb_bytes = None
         self.depth_image = None
         self.depth_bytes = None
-        self.rgb_forward_image = None
-        self.rgb_forward_bytes = None
         self.new_image_arrived = False
         self.new_vis_image_arrived = False
         self.rgb_time = 0.0
+        self.depth_time = 0.0
+        self.last_rgb_time = 0.0
+        self.last_depth_time = 0.0
 
         self.odom = None
         self.linear_vel = 0.0
@@ -239,18 +265,13 @@ class Go2Manager(Node):
         self.homo_goal = None
         self.vel = None
 
-    def rgb_forward_callback(self, rgb_msg):
-        raw_image = self.cv_bridge.imgmsg_to_cv2(rgb_msg, 'rgb8')[:, :, :]
-        self.rgb_forward_image = raw_image
-        image = PIL_Image.fromarray(self.rgb_forward_image)
-        image_bytes = io.BytesIO()
-        image.save(image_bytes, format='JPEG')
-        image_bytes.seek(0)
-        self.rgb_forward_bytes = image_bytes
-        self.new_vis_image_arrived = True
-        self.new_image_arrived = True
+        self.get_logger().info(f'RGB topic: {args.rgb_topic}')
+        self.get_logger().info(f'Depth topic: {args.depth_topic}')
+        self.get_logger().info(f'Odom topic: {args.odom_topic}')
+        self.get_logger().info(f'CmdVel topic: {args.cmd_vel_topic}')
+        self.get_logger().info(f'Server URL: {self.server_url}')
 
-    def rgb_depth_down_callback(self, rgb_msg, depth_msg):
+    def rgb_depth_callback(self, rgb_msg, depth_msg):
         raw_image = self.cv_bridge.imgmsg_to_cv2(rgb_msg, 'rgb8')[:, :, :]
         self.rgb_image = raw_image
         image = PIL_Image.fromarray(self.rgb_image)
@@ -259,11 +280,9 @@ class Go2Manager(Node):
         image_bytes.seek(0)
 
         raw_depth = self.cv_bridge.imgmsg_to_cv2(depth_msg, '16UC1')
-        raw_depth[np.isnan(raw_depth)] = 0
-        raw_depth[np.isinf(raw_depth)] = 0
-        self.depth_image = raw_depth / 1000.0
-        self.depth_image -= 0.0
-        self.depth_image[np.where(self.depth_image < 0)] = 0
+        raw_depth = np.nan_to_num(raw_depth, nan=0.0, posinf=0.0, neginf=0.0)
+        self.depth_image = raw_depth.astype(np.float32) / 1000.0
+        self.depth_image[self.depth_image < 0] = 0
         depth = (np.clip(self.depth_image * 10000.0, 0, 65535)).astype(np.uint16)
         depth = PIL_Image.fromarray(depth)
         depth_bytes = io.BytesIO()
@@ -272,14 +291,11 @@ class Go2Manager(Node):
 
         rgb_depth_rw_lock.acquire_write()
         self.rgb_bytes = image_bytes
-
         self.rgb_time = rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec / 1.0e9
         self.last_rgb_time = self.rgb_time
-
         self.depth_bytes = depth_bytes
         self.depth_time = depth_msg.header.stamp.sec + depth_msg.header.stamp.nanosec / 1.0e9
         self.last_depth_time = self.depth_time
-
         rgb_depth_rw_lock.release_write()
 
         self.new_vis_image_arrived = True
@@ -298,9 +314,9 @@ class Go2Manager(Node):
         self.angular_vel = msg.twist.twist.angular.z
         odom_rw_lock.release_write()
 
-        R0 = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+        rotation = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
         self.homo_odom = np.eye(4)
-        self.homo_odom[:2, :2] = R0
+        self.homo_odom[:2, :2] = rotation
         self.homo_odom[:2, 3] = [msg.pose.pose.position.x, msg.pose.pose.position.y]
         self.vel = [msg.twist.twist.linear.x, msg.twist.twist.angular.z]
 
@@ -309,7 +325,7 @@ class Go2Manager(Node):
 
     def incremental_change_goal(self, actions):
         if self.homo_goal is None:
-            raise ValueError("Please initialize homo_goal before change it!")
+            raise ValueError('Please initialize homo_goal before change it!')
         homo_goal = self.homo_odom.copy()
         for each_action in actions:
             if each_action == 0:
@@ -336,12 +352,17 @@ class Go2Manager(Node):
         request = Twist()
         request.linear.x = vx
         request.linear.y = 0.0
-        request.angular.z = vyaw
 
+        # LIMO can turn in place, but very small yaw rates are effectively ignored by the base.
+        if abs(vx) < self.turn_in_place_linear_threshold and abs(vyaw) > self.turn_in_place_angular_deadband:
+            vyaw = math.copysign(max(abs(vyaw), self.turn_in_place_omega), vyaw)
+
+        request.angular.z = vyaw
         self.control_pub.publish(request)
 
 
 if __name__ == '__main__':
+    args = parse_args()
     control_thread_instance = threading.Thread(target=control_thread)
     planning_thread_instance = threading.Thread(target=planning_thread)
     control_thread_instance.daemon = True
@@ -349,14 +370,13 @@ if __name__ == '__main__':
     rclpy.init()
 
     try:
-        manager = Go2Manager()
-
+        manager = LimoManager(args)
         control_thread_instance.start()
         planning_thread_instance.start()
-
         rclpy.spin(manager)
     except KeyboardInterrupt:
         pass
     finally:
-        manager.destroy_node()
+        if manager is not None:
+            manager.destroy_node()
         rclpy.shutdown()

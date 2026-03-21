@@ -5,6 +5,9 @@ import time
 from datetime import datetime
 
 import numpy as np
+
+os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+
 from flask import Flask, jsonify, request
 from PIL import Image
 
@@ -14,6 +17,11 @@ app = Flask(__name__)
 idx = 0
 start_time = time.time()
 output_dir = ''
+DEFAULT_INSTRUCTION = (
+    "Turn around and walk out of this office. Turn towards your slight right at the chair. "
+    "Move forward to the walkway and go near the red bin. You can see an open door on your right side, "
+    "go inside the open door. Stop at the computer monitor"
+)
 
 
 @app.route("/eval_dual", methods=['POST'])
@@ -37,8 +45,8 @@ def eval_dual():
     print(f"read http data cost {time.time() - start_time}")
 
     camera_pose = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-    instruction = "Turn around and walk out of this office. Turn towards your slight right at the chair. Move forward to the walkway and go near the red bin. You can see an open door on your right side, go inside the open door. Stop at the computer monitor"
-    policy_init = data['reset']
+    instruction = data.get('instruction', DEFAULT_INSTRUCTION)
+    policy_init = data.get('reset', False)
     if policy_init:
         start_time = time.time()
         idx = 0
@@ -51,15 +59,24 @@ def eval_dual():
 
     look_down = False
     t0 = time.time()
-    dual_sys_output = {}
 
     dual_sys_output = agent.step(
-        image, depth, camera_pose, instruction, intrinsic=args.camera_intrinsic, look_down=look_down
+        image,
+        depth,
+        camera_pose,
+        instruction,
+        intrinsic=args.camera_intrinsic,
+        look_down=look_down,
     )
     if dual_sys_output.output_action is not None and dual_sys_output.output_action == [5]:
         look_down = True
         dual_sys_output = agent.step(
-            image, depth, camera_pose, instruction, intrinsic=args.camera_intrinsic, look_down=look_down
+            image,
+            depth,
+            camera_pose,
+            instruction,
+            intrinsic=args.camera_intrinsic,
+            look_down=look_down,
         )
 
     json_output = {}
@@ -78,13 +95,13 @@ def eval_dual():
 
 
 if __name__ == '__main__':
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--model_path", type=str, default="checkpoints/InternVLA-N1")
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
+    parser.add_argument("--plan_step_gap", type=int, default=4)
     args = parser.parse_args()
 
     args.camera_intrinsic = np.array(
@@ -92,10 +109,11 @@ if __name__ == '__main__':
     )
     agent = InternVLAN1AsyncAgent(args)
     agent.step(
-        np.zeros((480, 640, 3)),
-        np.zeros((480, 640)),
+        np.zeros((480, 640, 3), dtype=np.uint8),
+        np.zeros((480, 640), dtype=np.float32),
         np.eye(4),
         "hello",
+        intrinsic=args.camera_intrinsic,
     )
     agent.reset()
 

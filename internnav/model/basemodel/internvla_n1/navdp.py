@@ -1,9 +1,15 @@
+import sys
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from diffusion_policy.model.diffusion.positional_embedding import SinusoidalPosEmb
 
-from internnav.model.encoder.navdp_backbone import *  # noqa: F403
+ENCODER_ROOT = Path(__file__).resolve().parents[2] / 'encoder'
+if str(ENCODER_ROOT) not in sys.path:
+    sys.path.append(str(ENCODER_ROOT))
+
+from navdp_backbone import *  # noqa: F403
 
 local_rank = None
 
