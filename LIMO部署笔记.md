@@ -510,9 +510,83 @@ ros2 run rqt_plot rqt_plot
 3. 转向搜索动作是否需要进一步做防抖和平滑处理
 
 
-运行代码
 python http_internvla_client.py \
   --server_url http://192.168.100.10:5801/eval_dual \
   --instruction "If you see a chair, move straight toward the chair and stop close to it. If you do not see a chair, turn slowly to search." \
   --turn_in_place_omega 0.4 \
   --turn_in_place_angular_deadband 0.0
+## 最新可视化增强记录
+
+已在 `scripts/realworld/http_internvla_client.py` 中增加两类调试可视化输出：
+
+### 1. 调试图像话题
+
+默认发布：
+
+- `/internnav/debug_image`
+
+图像中会叠加：
+
+- 当前 `discrete_action`
+- 当前轨迹点数量
+- `pixel_goal` 红色标记点
+
+### 2. 轨迹 Path 话题
+
+默认发布：
+
+- `/internnav/debug_path`
+
+该话题会把当前局部轨迹以 `nav_msgs/Path` 的形式发布，坐标系为 `odom`。
+
+### 查看方法
+
+在小车端：
+
+```bash
+ros2 run rqt_image_view rqt_image_view
+```
+
+选择：
+
+- `/internnav/debug_image`
+
+在 RViz2 中可添加：
+
+- `Path`，Topic 选择 `/internnav/debug_path`
+- `TF`
+- `Odometry`，Topic 选择 `/odom`
+
+说明：
+
+- 当前仍然没有独立的地图话题发布。
+- 但现在已经可以直接看到模型的 `pixel_goal` 和当前局部轨迹。
+
+
+
+## 运行时目标发现提示
+
+当前是否找到椅子的权威判断以 PC 端服务日志为准。
+
+PC 端服务终端会输出明显的状态标志：
+
+- `[SEARCHING_FOR_CHAIR]`：当前还在搜索椅子
+- `[FOUND_CHAIR_CANDIDATE]`：当前已经给出像素目标点，可视为发现椅子候选目标
+- `[TRACKING_TARGET]`：当前已经输出局部轨迹，开始跟踪目标方向
+- `[MOVING_TOWARD_TARGET]`：当前离散动作里已经包含前进动作
+
+这些日志会保存到 PC 端：
+
+- `test_data/时间戳目录/server_runtime.log`
+
+日志中会额外保存：
+
+- 状态切换标志
+- 每次 HTTP 返回的原始 JSON：`[RAW_RESPONSE] ...`
+
+如果需要查看本次运行日志，可在 PC 端执行：
+
+```bash
+ls test_data
+tail -f test_data/时间戳目录/server_runtime.log
+```

@@ -41,6 +41,46 @@
 
 ## 一次完整启动顺序
 
+### 第 0 步：如有旧服务，先清理 `5801` 端口
+
+在 PC 上执行：
+
+```bash
+lsof -i:5801
+```
+
+如果看到旧的 `python` 服务仍在监听 `5801`，先结束该进程：
+
+```bash
+kill PID
+```
+
+例如：
+
+```bash
+kill 17046
+```
+
+如果普通 `kill` 后仍未退出，可再执行：
+
+```bash
+kill -9 PID
+```
+
+然后再次确认端口已经释放：
+
+```bash
+lsof -i:5801
+```
+
+如果没有输出，说明端口已释放，可以继续启动新的服务端。
+
+也可以直接使用一条命令清理旧服务：
+
+```bash
+pkill -f "python scripts/realworld/http_internvla_server.py"
+```
+
 ### 第 1 步：PC 端启动推理服务
 
 在 PC 上执行：
@@ -334,3 +374,93 @@ source ~/venvs/internnav_limo/bin/activate
 
 - `--turn_in_place_omega 0.6`
 - 或 `--turn_in_place_omega 0.8`
+## 当前服务端相机内参
+
+PC 服务端当前使用的小车真实彩色相机内参来自：
+
+- `/camera/color/camera_info`
+
+当前参数：
+
+- 分辨率：`640 x 480`
+- `fx = 489.2552490234375`
+- `fy = 489.2552490234375`
+- `cx = 317.91510009765625`
+- `cy = 216.17910766601562`
+
+说明：
+
+- 如重新部署服务端，请确保 `scripts/realworld/http_internvla_server.py` 中保持这组内参。
+- 如果后续更换相机分辨率或更换相机设备，需要重新读取 `camera_info` 并同步更新服务端。
+## 当前调试可视化话题
+
+当前客户端启动后会额外发布：
+
+- 调试图像：`/internnav/debug_image`
+- 调试轨迹：`/internnav/debug_path`
+
+### 查看调试图像
+
+在小车端执行：
+
+```bash
+ros2 run rqt_image_view rqt_image_view
+```
+
+选择：
+
+- `/internnav/debug_image`
+
+图像中可看到：
+
+- 当前动作
+- `pixel_goal` 红色标记点
+- 当前轨迹点数量
+
+### 查看轨迹
+
+在小车端执行：
+
+```bash
+rviz2
+```
+
+在 RViz2 中添加：
+
+- `Path`，Topic 选择 `/internnav/debug_path`
+- `TF`
+- `Odometry`，Topic 选择 `/odom`
+
+说明：
+
+- 当前这套链路默认还不会发布地图。
+- 但已经可以可视化当前局部轨迹和模型给出的像素目标。
+
+
+
+## 运行时目标发现提示
+
+当前是否找到椅子的权威判断以 PC 端服务日志为准。
+
+PC 端服务终端会输出明显的状态标志：
+
+- `[SEARCHING_FOR_CHAIR]`：当前还在搜索椅子
+- `[FOUND_CHAIR_CANDIDATE]`：当前已经给出像素目标点，可视为发现椅子候选目标
+- `[TRACKING_TARGET]`：当前已经输出局部轨迹，开始跟踪目标方向
+- `[MOVING_TOWARD_TARGET]`：当前离散动作里已经包含前进动作
+
+这些日志会保存到 PC 端：
+
+- `test_data/时间戳目录/server_runtime.log`
+
+日志中会额外保存：
+
+- 状态切换标志
+- 每次 HTTP 返回的原始 JSON：`[RAW_RESPONSE] ...`
+
+如果需要查看本次运行日志，可在 PC 端执行：
+
+```bash
+ls test_data
+tail -f test_data/时间戳目录/server_runtime.log
+```

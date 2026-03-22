@@ -12,10 +12,10 @@ import numpy as np
 import rclpy
 import requests
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PoseStamped, Twist
 from message_filters import ApproximateTimeSynchronizer, Subscriber
-from nav_msgs.msg import Odometry
-from PIL import Image as PIL_Image
+from nav_msgs.msg import Odometry, Path
+from PIL import Image as PIL_Image, ImageDraw
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
@@ -40,7 +40,7 @@ class ControlMode(Enum):
 
 policy_init = True
 mpc = None
-pid = PID_controller(Kp_trans=2.0, Kd_trans=0.0, Kp_yaw=1.5, Kd_yaw=0.0, max_v=0.6, max_w=0.5)
+pid = PID_controller(Kp_trans=1.5, Kd_trans=0.0, Kp_yaw=0.9, Kd_yaw=0.0, max_v=0.10, max_w=0.2)
 http_idx = -1
 first_running_time = 0.0
 last_pixel_goal = None
@@ -66,9 +66,13 @@ def parse_args():
     parser.add_argument('--cmd_vel_topic', type=str, default='/cmd_vel')
     parser.add_argument('--sync_queue_size', type=int, default=5)
     parser.add_argument('--sync_slop', type=float, default=0.1)
-    parser.add_argument('--turn_in_place_omega', type=float, default=1.0)
-    parser.add_argument('--turn_in_place_linear_threshold', type=float, default=0.05)
+    parser.add_argument('--turn_in_place_omega', type=float, default=0.5)
+    parser.add_argument('--turn_in_place_linear_threshold', type=float, default=0.01)
     parser.add_argument('--turn_in_place_angular_deadband', type=float, default=0.02)
+    parser.add_argument('--turn_direction_hold_sec', type=float, default=0.6)
+    parser.add_argument('--debug_image_topic', type=str, default='/internnav/debug_image')
+    parser.add_argument('--debug_path_topic', type=str, default='/internnav/debug_path')
+    parser.add_argument('--frame_process_interval', type=float, default=0.3)
     return parser.parse_args()
 
 
@@ -112,7 +116,7 @@ def control_thread():
                 v, w = opt_u_controls[0, 0], opt_u_controls[0, 1]
 
                 desired_v, desired_w = v, w
-                manager.move(v, 0.0, w)
+                manager.move(v, 0.0, w, allow_turn_boost=False)
         elif current_control_mode == ControlMode.PID_MODE:
             odom_rw_lock.acquire_read()
             odom = manager.odom.copy() if manager.odom else None
@@ -126,7 +130,7 @@ def control_thread():
                 if v < 0.0:
                     v = 0.0
                 desired_v, desired_w = v, w
-                manager.move(v, 0.0, w)
+                manager.move(v, 0.0, w, allow_turn_boost=True)
 
         time.sleep(0.1)
 
@@ -170,7 +174,6 @@ def planning_thread():
             if len(frame_data) > 100:
                 del frame_data[min(frame_data.keys())]
             response = dual_sys_eval(rgb_bytes, depth_bytes, manager.server_url, manager.instruction)
-
             global current_control_mode
             if 'trajectory' in response:
                 trajectory = response['trajectory']
@@ -197,6 +200,8 @@ def planning_thread():
                 print(f'{time.time()} update traj')
 
                 manager.last_trajs_in_world = trajs_in_world
+                manager.publish_debug_path(trajs_in_world)
+                manager.publish_debug_image(infer_rgb, response)
                 mpc_rw_lock.acquire_write()
                 global mpc
                 if mpc is None:
@@ -210,6 +215,7 @@ def planning_thread():
                 actions = response['discrete_action']
                 if actions != [5] and actions != [9]:
                     manager.incremental_change_goal(actions)
+                    manager.publish_debug_image(infer_rgb, response)
                     current_control_mode = ControlMode.PID_MODE
         else:
             print(
@@ -228,6 +234,8 @@ class LimoManager(Node):
         self.turn_in_place_omega = args.turn_in_place_omega
         self.turn_in_place_linear_threshold = args.turn_in_place_linear_threshold
         self.turn_in_place_angular_deadband = args.turn_in_place_angular_deadband
+        self.turn_direction_hold_sec = args.turn_direction_hold_sec
+        self.frame_process_interval = args.frame_process_interval
 
         qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
 
@@ -237,6 +245,8 @@ class LimoManager(Node):
         self.syncronizer.registerCallback(self.rgb_depth_callback)
         self.odom_sub = self.create_subscription(Odometry, args.odom_topic, self.odom_callback, qos_profile)
         self.control_pub = self.create_publisher(Twist, args.cmd_vel_topic, 5)
+        self.debug_image_pub = self.create_publisher(Image, args.debug_image_topic, 5)
+        self.debug_path_pub = self.create_publisher(Path, args.debug_path_topic, 5)
 
         self.cv_bridge = CvBridge()
         self.rgb_image = None
@@ -249,6 +259,7 @@ class LimoManager(Node):
         self.depth_time = 0.0
         self.last_rgb_time = 0.0
         self.last_depth_time = 0.0
+        self.last_processed_frame_time = 0.0
 
         self.odom = None
         self.linear_vel = 0.0
@@ -264,14 +275,28 @@ class LimoManager(Node):
         self.homo_odom = None
         self.homo_goal = None
         self.vel = None
+        self.last_turn_sign = 0
+        self.last_turn_sign_time = 0.0
 
         self.get_logger().info(f'RGB topic: {args.rgb_topic}')
         self.get_logger().info(f'Depth topic: {args.depth_topic}')
         self.get_logger().info(f'Odom topic: {args.odom_topic}')
         self.get_logger().info(f'CmdVel topic: {args.cmd_vel_topic}')
         self.get_logger().info(f'Server URL: {self.server_url}')
+        self.get_logger().info(f'Debug image topic: {args.debug_image_topic}')
+        self.get_logger().info(f'Debug path topic: {args.debug_path_topic}')
+        self.get_logger().info(f'Frame process interval: {self.frame_process_interval}s')
+
+
 
     def rgb_depth_callback(self, rgb_msg, depth_msg):
+        rgb_time = rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec / 1.0e9
+        if (
+            self.last_processed_frame_time > 0.0
+            and rgb_time - self.last_processed_frame_time < self.frame_process_interval
+        ):
+            return
+
         raw_image = self.cv_bridge.imgmsg_to_cv2(rgb_msg, 'rgb8')[:, :, :]
         self.rgb_image = raw_image
         image = PIL_Image.fromarray(self.rgb_image)
@@ -291,15 +316,62 @@ class LimoManager(Node):
 
         rgb_depth_rw_lock.acquire_write()
         self.rgb_bytes = image_bytes
-        self.rgb_time = rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec / 1.0e9
+        self.rgb_time = rgb_time
         self.last_rgb_time = self.rgb_time
         self.depth_bytes = depth_bytes
         self.depth_time = depth_msg.header.stamp.sec + depth_msg.header.stamp.nanosec / 1.0e9
         self.last_depth_time = self.depth_time
         rgb_depth_rw_lock.release_write()
 
+        self.last_processed_frame_time = rgb_time
         self.new_vis_image_arrived = True
         self.new_image_arrived = True
+
+    def publish_debug_image(self, rgb_image, response):
+        if rgb_image is None:
+            return
+
+        debug_image = PIL_Image.fromarray(np.asarray(rgb_image, dtype=np.uint8)).convert('RGB')
+        draw = ImageDraw.Draw(debug_image)
+
+        overlay_lines = []
+        if 'discrete_action' in response:
+            overlay_lines.append(f"action: {response['discrete_action']}")
+        if 'trajectory' in response:
+            overlay_lines.append(f"traj_pts: {len(response['trajectory'])}")
+        if 'pixel_goal' in response and len(response['pixel_goal']) == 2:
+            pixel_x = int(response['pixel_goal'][0])
+            pixel_y = int(response['pixel_goal'][1])
+            cross_half = 8
+            draw.ellipse((pixel_x - 6, pixel_y - 6, pixel_x + 6, pixel_y + 6), outline='red', width=3)
+            draw.line((pixel_x - cross_half, pixel_y, pixel_x + cross_half, pixel_y), fill='red', width=3)
+            draw.line((pixel_x, pixel_y - cross_half, pixel_x, pixel_y + cross_half), fill='red', width=3)
+            overlay_lines.append(f'pixel_goal: ({pixel_x}, {pixel_y})')
+
+        if overlay_lines:
+            draw.rectangle((8, 8, 430, 32 + 22 * len(overlay_lines)), outline='yellow', width=2)
+            for idx, line in enumerate(overlay_lines):
+                draw.text((16, 16 + idx * 22), line, fill='yellow')
+
+        msg = self.cv_bridge.cv2_to_imgmsg(np.array(debug_image), encoding='rgb8')
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'camera_color_optical_frame'
+        self.debug_image_pub.publish(msg)
+
+    def publish_debug_path(self, traj_points):
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = 'odom'
+
+        for point in traj_points:
+            pose = PoseStamped()
+            pose.header = path_msg.header
+            pose.pose.position.x = float(point[0])
+            pose.pose.position.y = float(point[1])
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+
+        self.debug_path_pub.publish(path_msg)
 
     def odom_callback(self, msg):
         self.odom_cnt += 1
@@ -332,30 +404,42 @@ class LimoManager(Node):
                 pass
             elif each_action == 1:
                 yaw = math.atan2(homo_goal[1, 0], homo_goal[0, 0])
-                homo_goal[0, 3] += 0.25 * np.cos(yaw)
-                homo_goal[1, 3] += 0.25 * np.sin(yaw)
+                homo_goal[0, 3] += 0.15 * np.cos(yaw)
+                homo_goal[1, 3] += 0.15 * np.sin(yaw)
             elif each_action == 2:
-                angle = math.radians(15)
+                angle = math.radians(10)
                 rotation_matrix = np.array(
                     [[math.cos(angle), -math.sin(angle), 0], [math.sin(angle), math.cos(angle), 0], [0, 0, 1]]
                 )
                 homo_goal[:3, :3] = np.dot(rotation_matrix, homo_goal[:3, :3])
             elif each_action == 3:
-                angle = -math.radians(15.0)
+                angle = -math.radians(10.0)
                 rotation_matrix = np.array(
                     [[math.cos(angle), -math.sin(angle), 0], [math.sin(angle), math.cos(angle), 0], [0, 0, 1]]
                 )
                 homo_goal[:3, :3] = np.dot(rotation_matrix, homo_goal[:3, :3])
         self.homo_goal = homo_goal
 
-    def move(self, vx, vy, vyaw):
+    def move(self, vx, vy, vyaw, allow_turn_boost=True):
         request = Twist()
         request.linear.x = vx
         request.linear.y = 0.0
 
-        # LIMO can turn in place, but very small yaw rates are effectively ignored by the base.
-        if abs(vx) < self.turn_in_place_linear_threshold and abs(vyaw) > self.turn_in_place_angular_deadband:
-            vyaw = math.copysign(max(abs(vyaw), self.turn_in_place_omega), vyaw)
+        # For LIMO, only apply aggressive turn-in-place boosting during search-like PID turning.
+        if allow_turn_boost and abs(vx) < self.turn_in_place_linear_threshold and abs(vyaw) > self.turn_in_place_angular_deadband:
+            now = time.time()
+            turn_sign = 1 if vyaw >= 0.0 else -1
+            if (
+                self.last_turn_sign != 0
+                and turn_sign != self.last_turn_sign
+                and (now - self.last_turn_sign_time) < self.turn_direction_hold_sec
+            ):
+                turn_sign = self.last_turn_sign
+            vyaw = turn_sign * max(abs(vyaw), self.turn_in_place_omega)
+            self.last_turn_sign = turn_sign
+            self.last_turn_sign_time = now
+        else:
+            self.last_turn_sign = 0
 
         request.angular.z = vyaw
         self.control_pub.publish(request)

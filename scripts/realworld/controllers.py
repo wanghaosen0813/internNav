@@ -12,7 +12,7 @@ from scipy.interpolate import interp1d
 
 
 class Mpc_controller:
-    def __init__(self, global_planed_traj, N=20, desired_v=0.3, v_max=0.4, w_max=0.4, ref_gap=4):
+    def __init__(self, global_planed_traj, N=20, desired_v=0.10, v_max=0.10, w_max=0.18, ref_gap=4):
         """Initialize the MPC controller.
 
         Args:
@@ -150,7 +150,7 @@ class Mpc_controller:
 
 
 class PID_controller:
-    def __init__(self, Kp_trans=1.0, Kd_trans=0.1, Kp_yaw=1.0, Kd_yaw=1.0, max_v=1.0, max_w=1.2):
+    def __init__(self, Kp_trans=1.0, Kd_trans=0.1, Kp_yaw=1.0, Kd_yaw=1.0, max_v=0.10, max_w=0.2):
         """Initialize the PID controller.
 
         Args:
