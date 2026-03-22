@@ -3,22 +3,25 @@ import copy
 import io
 import json
 import math
+import subprocess
 import threading
 import time
+
+import cv2
 from collections import deque
 from enum import Enum
 
 import numpy as np
 import rclpy
 import requests
+import message_filters
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped, Twist
-from message_filters import ApproximateTimeSynchronizer, Subscriber
 from nav_msgs.msg import Odometry, Path
 from PIL import Image as PIL_Image, ImageDraw
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 
 from controllers import Mpc_controller, PID_controller
 from thread_utils import ReadWriteLock
@@ -54,18 +57,24 @@ desired_v, desired_w = 0.0, 0.0
 rgb_depth_rw_lock = ReadWriteLock()
 odom_rw_lock = ReadWriteLock()
 mpc_rw_lock = ReadWriteLock()
+stop_event = threading.Event()
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--server_url', type=str, default='http://127.0.0.1:5801/eval_dual')
     parser.add_argument('--instruction', type=str, default=DEFAULT_INSTRUCTION)
-    parser.add_argument('--rgb_topic', type=str, default='/camera/color/image_raw')
-    parser.add_argument('--depth_topic', type=str, default='/camera/depth/image_raw')
+    parser.add_argument('--rgb_topic', type=str, default=None)
+    parser.add_argument('--depth_topic', type=str, default=None)
     parser.add_argument('--odom_topic', type=str, default='/odom')
     parser.add_argument('--cmd_vel_topic', type=str, default='/cmd_vel')
-    parser.add_argument('--sync_queue_size', type=int, default=5)
-    parser.add_argument('--sync_slop', type=float, default=0.1)
+    parser.add_argument('--sync_queue_size', type=int, default=20)
+    parser.add_argument('--sync_slop', type=float, default=0.3)
+    parser.add_argument('--use_compressed_rgb', dest='use_compressed_rgb', action='store_true')
+    parser.add_argument('--no-use_compressed_rgb', dest='use_compressed_rgb', action='store_false')
+    parser.add_argument('--use_compressed_depth', dest='use_compressed_depth', action='store_true')
+    parser.add_argument('--no-use_compressed_depth', dest='use_compressed_depth', action='store_false')
+    parser.set_defaults(use_compressed_rgb=True, use_compressed_depth=True)
     parser.add_argument('--turn_in_place_omega', type=float, default=0.5)
     parser.add_argument('--turn_in_place_linear_threshold', type=float, default=0.01)
     parser.add_argument('--turn_in_place_angular_deadband', type=float, default=0.02)
@@ -73,7 +82,43 @@ def parse_args():
     parser.add_argument('--debug_image_topic', type=str, default='/internnav/debug_image')
     parser.add_argument('--debug_path_topic', type=str, default='/internnav/debug_path')
     parser.add_argument('--frame_process_interval', type=float, default=0.3)
+    parser.add_argument('--rgb_callback_min_interval', type=float, default=0.1)
+    parser.add_argument('--reuse_depth_max_age', type=float, default=1.0)
     return parser.parse_args()
+
+
+def build_client_log_url(server_url):
+    return server_url.rsplit('/', 1)[0] + '/client_log'
+
+
+def post_client_log(url, message):
+    try:
+        requests.post(url, json={'message': message}, timeout=2)
+    except Exception:
+        pass
+
+
+def _sample_topic_hz(topic, duration, client_log_url):
+    try:
+        result = subprocess.run(
+            ['ros2', 'topic', 'hz', '--window', '50', topic],
+            capture_output=True, text=True, timeout=duration,
+        )
+        output = (result.stdout or result.stderr).strip()
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or '').strip()
+    except Exception as exc:
+        output = f'error: {exc}'
+    post_client_log(client_log_url, f'[topic_hz] {topic}: {output}')
+
+
+def start_topic_hz_logging(rgb_topic, depth_topic, client_log_url, duration=10):
+    for topic in (rgb_topic, depth_topic):
+        threading.Thread(
+            target=_sample_topic_hz,
+            args=(topic, duration, client_log_url),
+            daemon=True,
+        ).start()
 
 
 def dual_sys_eval(image_bytes, depth_bytes, url, instruction):
@@ -94,17 +139,21 @@ def dual_sys_eval(image_bytes, depth_bytes, url, instruction):
     response = requests.post(url, files=files, data={'json': json_data}, timeout=100)
     response.raise_for_status()
     print(f'response {response.text}')
+    if manager is not None:
+        manager.emit_client_log(f'response {response.text}')
     http_idx += 1
     if http_idx == 0:
         first_running_time = time.time()
     print(f'idx: {http_idx} after http {time.time() - start}')
+    if manager is not None:
+        manager.emit_client_log(f'idx: {http_idx} after http {time.time() - start}')
 
     return json.loads(response.text)
 
 
 def control_thread():
     global desired_v, desired_w
-    while True:
+    while not stop_event.is_set():
         global current_control_mode
         if current_control_mode == ControlMode.MPC_MODE:
             odom_rw_lock.acquire_read()
@@ -138,7 +187,7 @@ def control_thread():
 def planning_thread():
     global trajs_in_world
 
-    while True:
+    while not stop_event.is_set():
         start_time = time.time()
         desired_time = 0.3
         time.sleep(0.05)
@@ -157,12 +206,16 @@ def planning_thread():
         odom_rw_lock.acquire_read()
         min_diff = 1e10
         odom_infer = None
+        latest_odom = copy.deepcopy(manager.odom) if manager.odom is not None else None
         for odom in manager.odom_queue:
             diff = abs(odom[0] - rgb_time)
             if diff < min_diff:
                 min_diff = diff
                 odom_infer = copy.deepcopy(odom[1])
         odom_rw_lock.release_read()
+        if odom_infer is None and latest_odom is not None:
+            odom_infer = latest_odom
+            manager.emit_client_log('[odom] Fallback to latest odom for planning')
 
         if odom_infer is not None and rgb_bytes is not None and depth_bytes is not None:
             global frame_data
@@ -181,6 +234,7 @@ def planning_thread():
                 odom = odom_infer
                 traj_len = np.linalg.norm(trajectory[-1][:2])
                 print(f'traj len {traj_len}')
+                manager.emit_client_log(f'traj len {traj_len}')
                 for i, traj in enumerate(trajectory):
                     if i < 3:
                         continue
@@ -198,6 +252,7 @@ def planning_thread():
                     trajs_in_world.append(w_P)
                 trajs_in_world = np.array(trajs_in_world)
                 print(f'{time.time()} update traj')
+                manager.emit_client_log(f'{time.time()} update traj')
 
                 manager.last_trajs_in_world = trajs_in_world
                 manager.publish_debug_path(trajs_in_world)
@@ -218,9 +273,9 @@ def planning_thread():
                     manager.publish_debug_image(infer_rgb, response)
                     current_control_mode = ControlMode.PID_MODE
         else:
-            print(
-                f'skip planning. odom_infer: {odom_infer is not None} rgb_bytes: {rgb_bytes is not None} depth_bytes: {depth_bytes is not None}'
-            )
+            skip_msg = f'skip planning. odom_infer: {odom_infer is not None} rgb_bytes: {rgb_bytes is not None} depth_bytes: {depth_bytes is not None}'
+            print(skip_msg)
+            manager.emit_client_log(skip_msg)
             time.sleep(0.1)
 
         time.sleep(max(0, desired_time - (time.time() - start_time)))
@@ -230,23 +285,45 @@ class LimoManager(Node):
     def __init__(self, args):
         super().__init__('limo_manager')
         self.server_url = args.server_url
+        self.client_log_url = build_client_log_url(args.server_url)
         self.instruction = args.instruction
         self.turn_in_place_omega = args.turn_in_place_omega
         self.turn_in_place_linear_threshold = args.turn_in_place_linear_threshold
         self.turn_in_place_angular_deadband = args.turn_in_place_angular_deadband
         self.turn_direction_hold_sec = args.turn_direction_hold_sec
         self.frame_process_interval = args.frame_process_interval
+        self.rgb_callback_min_interval = max(0.0, args.rgb_callback_min_interval)
+        self.reuse_depth_max_age = max(0.0, args.reuse_depth_max_age)
 
         qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
 
-        rgb_sub = Subscriber(self, Image, args.rgb_topic, qos_profile=qos_profile)
-        depth_sub = Subscriber(self, Image, args.depth_topic, qos_profile=qos_profile)
-        self.syncronizer = ApproximateTimeSynchronizer([rgb_sub, depth_sub], args.sync_queue_size, args.sync_slop)
-        self.syncronizer.registerCallback(self.rgb_depth_callback)
+        self.use_compressed_rgb = args.use_compressed_rgb
+        self.use_compressed_depth = args.use_compressed_depth
+        self.sync_slop = args.sync_slop
+        self.frame_pair_queue_size = max(2, args.sync_queue_size)
+        self.rgb_topic = args.rgb_topic or (
+            '/camera/color/image_raw/compressed' if self.use_compressed_rgb else '/camera/color/image_raw'
+        )
+        self.depth_topic = args.depth_topic or (
+            '/camera/depth/image_raw/compressedDepth' if self.use_compressed_depth else '/camera/depth/image_raw'
+        )
+
+        rgb_msg_type = CompressedImage if self.use_compressed_rgb else Image
+        depth_msg_type = CompressedImage if self.use_compressed_depth else Image
+
+        self.rgb_sub = message_filters.Subscriber(self, rgb_msg_type, self.rgb_topic, qos_profile=qos_profile)
+        self.depth_sub = message_filters.Subscriber(self, depth_msg_type, self.depth_topic, qos_profile=qos_profile)
+        self.sync = message_filters.ApproximateTimeSynchronizer(
+            [self.rgb_sub, self.depth_sub], queue_size=self.frame_pair_queue_size, slop=self.sync_slop
+        )
+        self.sync.registerCallback(self.sync_callback)
+        self.rgb_sub.registerCallback(self.rgb_monitor_callback)
+        self.depth_sub.registerCallback(self.depth_monitor_callback)
         self.odom_sub = self.create_subscription(Odometry, args.odom_topic, self.odom_callback, qos_profile)
         self.control_pub = self.create_publisher(Twist, args.cmd_vel_topic, 5)
         self.debug_image_pub = self.create_publisher(Image, args.debug_image_topic, 5)
         self.debug_path_pub = self.create_publisher(Path, args.debug_path_topic, 5)
+        self.input_health_timer = self.create_timer(1.0, self.monitor_input_health)
 
         self.cv_bridge = CvBridge()
         self.rgb_image = None
@@ -260,6 +337,25 @@ class LimoManager(Node):
         self.last_rgb_time = 0.0
         self.last_depth_time = 0.0
         self.last_processed_frame_time = 0.0
+        self.last_sync_receive_time = None
+        self.last_rgb_receive_time = None
+        self.last_depth_receive_time = None
+        self.last_rgb_msg_stamp = None
+        self.last_depth_msg_stamp = None
+        self.last_rgb_msg_gap = None
+        self.last_depth_msg_gap = None
+        self.last_sync_pair_dt = None
+        self.last_rgb_reuse_time = 0.0
+        self.last_reused_depth_age = None
+        self.reuse_depth_count = 0
+        self.last_good_depth_image = None
+        self.last_good_depth_bytes = None
+        self.last_good_depth_time = None
+        self.rgb_frame_count = 0
+        self.depth_frame_count = 0
+        self.sync_frame_count = 0
+        self.sync_drop_count = 0
+        self.processing_sync = False
 
         self.odom = None
         self.linear_vel = 0.0
@@ -277,55 +373,265 @@ class LimoManager(Node):
         self.vel = None
         self.last_turn_sign = 0
         self.last_turn_sign_time = 0.0
+        self.debug_log_times = {}
 
-        self.get_logger().info(f'RGB topic: {args.rgb_topic}')
-        self.get_logger().info(f'Depth topic: {args.depth_topic}')
+        self.get_logger().info(f'RGB topic: {self.rgb_topic}')
+        self.emit_client_log(f'RGB topic: {self.rgb_topic}')
+        self.get_logger().info(f'Depth topic: {self.depth_topic}')
+        self.emit_client_log(f'Depth topic: {self.depth_topic}')
         self.get_logger().info(f'Odom topic: {args.odom_topic}')
+        self.emit_client_log(f'Odom topic: {args.odom_topic}')
         self.get_logger().info(f'CmdVel topic: {args.cmd_vel_topic}')
+        self.emit_client_log(f'CmdVel topic: {args.cmd_vel_topic}')
         self.get_logger().info(f'Server URL: {self.server_url}')
+        self.emit_client_log(f'Server URL: {self.server_url}')
         self.get_logger().info(f'Debug image topic: {args.debug_image_topic}')
+        self.emit_client_log(f'Debug image topic: {args.debug_image_topic}')
         self.get_logger().info(f'Debug path topic: {args.debug_path_topic}')
+        self.emit_client_log(f'Debug path topic: {args.debug_path_topic}')
         self.get_logger().info(f'Frame process interval: {self.frame_process_interval}s')
+        self.emit_client_log(f'Frame process interval: {self.frame_process_interval}s')
+        self.get_logger().info(f'RGB callback min interval: {self.rgb_callback_min_interval}s')
+        self.emit_client_log(f'RGB callback min interval: {self.rgb_callback_min_interval}s')
+        self.get_logger().info(f'Reuse depth max age: {self.reuse_depth_max_age}s')
+        self.emit_client_log(f'Reuse depth max age: {self.reuse_depth_max_age}s')
+        self.get_logger().info(f'Use compressed RGB: {self.use_compressed_rgb}')
+        self.emit_client_log(f'Use compressed RGB: {self.use_compressed_rgb}')
+        self.get_logger().info(f'Use compressed Depth: {self.use_compressed_depth}')
+        self.emit_client_log(f'Use compressed Depth: {self.use_compressed_depth}')
+        self.get_logger().info(f'RGB/Depth pairing slop: {self.sync_slop}s')
+        self.emit_client_log(f'RGB/Depth pairing slop: {self.sync_slop}s')
+        self.get_logger().info(f'Frame pair queue size: {self.frame_pair_queue_size}')
+        self.emit_client_log(f'Frame pair queue size: {self.frame_pair_queue_size}')
 
+        start_topic_hz_logging(self.rgb_topic, self.depth_topic, self.client_log_url, duration=10)
 
+    @staticmethod
+    def _stamp_to_sec(stamp):
+        return stamp.sec + stamp.nanosec / 1.0e9
 
-    def rgb_depth_callback(self, rgb_msg, depth_msg):
-        rgb_time = rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec / 1.0e9
-        if (
-            self.last_processed_frame_time > 0.0
-            and rgb_time - self.last_processed_frame_time < self.frame_process_interval
-        ):
+    def _log_throttled(self, key, period_sec, message, level='info'):
+        now = time.time()
+        last_time = self.debug_log_times.get(key, 0.0)
+        if now - last_time < period_sec:
+            return
+        self.debug_log_times[key] = now
+        if level != 'info':
+            message = f'[WARN] {message}'
+        self.get_logger().info(message)
+        self.emit_client_log(message)
+
+    def emit_client_log(self, message):
+        post_client_log(self.client_log_url, message)
+
+    def _decode_rgb(self, rgb_msg):
+        if self.use_compressed_rgb:
+            image = None
+            try:
+                image = self.cv_bridge.compressed_imgmsg_to_cv2(rgb_msg, desired_encoding='rgb8')
+            except Exception:
+                image = None
+            if image is None:
+                np_arr = np.frombuffer(rgb_msg.data, np.uint8)
+                bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                if bgr is None:
+                    raise ValueError('Failed to decode compressed RGB image')
+                image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            return image[:, :, :]
+        return self.cv_bridge.imgmsg_to_cv2(rgb_msg, 'rgb8')[:, :, :]
+
+    def _decode_depth(self, depth_msg):
+        if self.use_compressed_depth:
+            depth = None
+            try:
+                depth = self.cv_bridge.compressed_imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+            except Exception:
+                depth = None
+            if depth is None:
+                data = depth_msg.data
+                png_magic = b"\x89PNG\r\n\x1a\n"
+                start = data.find(png_magic)
+                if start != -1:
+                    np_arr = np.frombuffer(data[start:], np.uint8)
+                    depth = cv2.imdecode(np_arr, cv2.IMREAD_UNCHANGED)
+            if depth is None:
+                raise ValueError('Failed to decode compressed depth image')
+            return depth
+        return self.cv_bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+
+    def rgb_monitor_callback(self, rgb_msg):
+        now = time.time()
+        rgb_time = self._stamp_to_sec(rgb_msg.header.stamp)
+        if self.last_rgb_msg_stamp is not None:
+            self.last_rgb_msg_gap = rgb_time - self.last_rgb_msg_stamp
+        self.last_rgb_msg_stamp = rgb_time
+        self.last_rgb_receive_time = now
+        self.rgb_frame_count += 1
+        gap_str = 'None' if self.last_rgb_msg_gap is None else f'{self.last_rgb_msg_gap:.3f}s'
+        self._log_throttled(
+            'rgb_heartbeat',
+            5.0,
+            f'[frame] RGB heartbeat count={self.rgb_frame_count} last_rgb_stamp={rgb_time:.3f} last_rgb_stamp_gap={gap_str}',
+        )
+
+        if self.processing_sync:
+            return
+        if self.last_good_depth_bytes is None or self.last_good_depth_image is None or self.last_good_depth_time is None:
+            return
+        if self.reuse_depth_max_age <= 0.0:
+            return
+        if self.last_processed_frame_time > 0.0 and rgb_time - self.last_processed_frame_time < self.frame_process_interval:
+            return
+        if self.last_rgb_reuse_time > 0.0 and now - self.last_rgb_reuse_time < self.rgb_callback_min_interval:
+            return
+        depth_age = rgb_time - self.last_good_depth_time
+        if depth_age <= self.sync_slop:
+            return
+        if depth_age > self.reuse_depth_max_age:
             return
 
-        raw_image = self.cv_bridge.imgmsg_to_cv2(rgb_msg, 'rgb8')[:, :, :]
-        self.rgb_image = raw_image
-        image = PIL_Image.fromarray(self.rgb_image)
-        image_bytes = io.BytesIO()
-        image.save(image_bytes, format='JPEG')
-        image_bytes.seek(0)
+        try:
+            raw_image = self._decode_rgb(rgb_msg)
+            image = PIL_Image.fromarray(raw_image)
+            image_bytes = io.BytesIO()
+            image.save(image_bytes, format='JPEG')
+            image_bytes.seek(0)
 
-        raw_depth = self.cv_bridge.imgmsg_to_cv2(depth_msg, '16UC1')
-        raw_depth = np.nan_to_num(raw_depth, nan=0.0, posinf=0.0, neginf=0.0)
-        self.depth_image = raw_depth.astype(np.float32) / 1000.0
-        self.depth_image[self.depth_image < 0] = 0
-        depth = (np.clip(self.depth_image * 10000.0, 0, 65535)).astype(np.uint16)
-        depth = PIL_Image.fromarray(depth)
-        depth_bytes = io.BytesIO()
-        depth.save(depth_bytes, format='PNG')
-        depth_bytes.seek(0)
+            rgb_depth_rw_lock.acquire_write()
+            self.rgb_image = raw_image
+            self.rgb_bytes = image_bytes
+            self.rgb_time = rgb_time
+            self.last_rgb_time = rgb_time
+            self.depth_image = self.last_good_depth_image.copy()
+            self.depth_bytes = copy.deepcopy(self.last_good_depth_bytes)
+            self.depth_time = self.last_good_depth_time
+            self.last_depth_time = self.last_good_depth_time
+            rgb_depth_rw_lock.release_write()
 
-        rgb_depth_rw_lock.acquire_write()
-        self.rgb_bytes = image_bytes
-        self.rgb_time = rgb_time
-        self.last_rgb_time = self.rgb_time
-        self.depth_bytes = depth_bytes
-        self.depth_time = depth_msg.header.stamp.sec + depth_msg.header.stamp.nanosec / 1.0e9
-        self.last_depth_time = self.depth_time
-        rgb_depth_rw_lock.release_write()
+            self.last_processed_frame_time = rgb_time
+            self.last_rgb_reuse_time = now
+            self.last_reused_depth_age = depth_age
+            self.reuse_depth_count += 1
+            self.new_vis_image_arrived = True
+            self.new_image_arrived = True
+            self._log_throttled(
+                'reuse_depth',
+                1.0,
+                f'[frame] Reusing recent depth. reuse_count={self.reuse_depth_count} depth_age={depth_age:.3f}s rgb_t={rgb_time:.3f} depth_t={self.last_good_depth_time:.3f}',
+                level='warn',
+            )
+        except Exception as exc:
+            self._log_throttled('reuse_depth_error', 2.0, f'[frame] Failed RGB+recent-depth fallback: {exc}', level='warn')
 
-        self.last_processed_frame_time = rgb_time
-        self.new_vis_image_arrived = True
-        self.new_image_arrived = True
+    def depth_monitor_callback(self, depth_msg):
+        now = time.time()
+        depth_time = self._stamp_to_sec(depth_msg.header.stamp)
+        if self.last_depth_msg_stamp is not None:
+            self.last_depth_msg_gap = depth_time - self.last_depth_msg_stamp
+        self.last_depth_msg_stamp = depth_time
+        self.last_depth_receive_time = now
+        self.depth_frame_count += 1
+        gap_str = 'None' if self.last_depth_msg_gap is None else f'{self.last_depth_msg_gap:.3f}s'
+        self._log_throttled(
+            'depth_heartbeat',
+            2.0,
+            f'[frame] Depth heartbeat count={self.depth_frame_count} last_depth_stamp={depth_time:.3f} last_depth_stamp_gap={gap_str}',
+        )
+
+    def sync_callback(self, rgb_msg, depth_msg):
+        rgb_time = self._stamp_to_sec(rgb_msg.header.stamp)
+        depth_time = self._stamp_to_sec(depth_msg.header.stamp)
+        pair_time = max(rgb_time, depth_time)
+        pair_dt = abs(rgb_time - depth_time)
+
+        if self.processing_sync:
+            self.sync_drop_count += 1
+            self._log_throttled(
+                'sync_busy_drop',
+                2.0,
+                f'[frame] Sync busy, dropping synchronized frame. sync_dropped={self.sync_drop_count} pair_dt={pair_dt:.3f}s',
+                level='warn',
+            )
+            return
+
+        if (
+            self.last_processed_frame_time > 0.0
+            and pair_time - self.last_processed_frame_time < self.frame_process_interval
+        ):
+            self._log_throttled(
+                'waiting_interval',
+                2.0,
+                f'[frame] Waiting for next process window. since_last={pair_time - self.last_processed_frame_time:.3f}s target={self.frame_process_interval:.3f}s pair_dt={pair_dt:.3f}s',
+            )
+            return
+
+        self.processing_sync = True
+        self.last_sync_receive_time = time.time()
+        self.last_sync_pair_dt = pair_dt
+        self._log_throttled(
+            'pair_success',
+            1.0,
+            f'[frame] Paired RGB/Depth successfully. pair_dt={pair_dt:.3f}s sync_count={self.sync_frame_count + 1} sync_dropped={self.sync_drop_count}',
+        )
+        try:
+            raw_image = self._decode_rgb(rgb_msg)
+            self.rgb_image = raw_image
+            image = PIL_Image.fromarray(self.rgb_image)
+            image_bytes = io.BytesIO()
+            image.save(image_bytes, format='JPEG')
+            image_bytes.seek(0)
+
+            raw_depth = self._decode_depth(depth_msg)
+            raw_depth = np.nan_to_num(raw_depth, nan=0.0, posinf=0.0, neginf=0.0)
+            if raw_depth.dtype == np.uint16:
+                depth_m = raw_depth.astype(np.float32) / 1000.0
+            else:
+                depth_m = raw_depth.astype(np.float32)
+            depth_m[depth_m < 0] = 0
+            self.depth_image = depth_m
+            depth = (np.clip(self.depth_image * 10000.0, 0, 65535)).astype(np.uint16)
+            depth = PIL_Image.fromarray(depth)
+            depth_bytes = io.BytesIO()
+            depth.save(depth_bytes, format='PNG')
+            depth_bytes.seek(0)
+
+            rgb_depth_rw_lock.acquire_write()
+            self.rgb_bytes = image_bytes
+            self.rgb_time = rgb_time
+            self.last_rgb_time = self.rgb_time
+            self.depth_bytes = depth_bytes
+            self.depth_time = depth_time
+            self.last_depth_time = self.depth_time
+            rgb_depth_rw_lock.release_write()
+
+            self.last_good_depth_image = depth_m.copy()
+            self.last_good_depth_bytes = copy.deepcopy(depth_bytes)
+            self.last_good_depth_time = depth_time
+            self.last_processed_frame_time = pair_time
+            self.new_vis_image_arrived = True
+            self.new_image_arrived = True
+            self.sync_frame_count += 1
+        except Exception as exc:
+            self._log_throttled('sync_process_error', 2.0, f'[frame] Failed to process synchronized RGB-D pair: {exc}', level='warn')
+        finally:
+            self.processing_sync = False
+
+    def monitor_input_health(self):
+        if stop_event.is_set():
+            return
+        now = time.time()
+        last_rgb_age = -1.0 if self.last_rgb_receive_time is None else now - self.last_rgb_receive_time
+        last_depth_age = -1.0 if self.last_depth_receive_time is None else now - self.last_depth_receive_time
+        last_sync_age = -1.0 if self.last_sync_receive_time is None else now - self.last_sync_receive_time
+        pair_dt = 'None' if self.last_sync_pair_dt is None else f'{self.last_sync_pair_dt:.3f}s'
+        depth_gap = 'None' if self.last_depth_msg_gap is None else f'{self.last_depth_msg_gap:.3f}s'
+        rgb_gap = 'None' if self.last_rgb_msg_gap is None else f'{self.last_rgb_msg_gap:.3f}s'
+        reused_depth_age = 'None' if self.last_reused_depth_age is None else f'{self.last_reused_depth_age:.3f}s'
+        self._log_throttled(
+            'input_health',
+            2.0,
+            f'[frame] Health rgb_count={self.rgb_frame_count} depth_count={self.depth_frame_count} sync_count={self.sync_frame_count} sync_dropped={self.sync_drop_count} reuse_depth_count={self.reuse_depth_count} last_rgb_age={last_rgb_age:.3f}s last_depth_age={last_depth_age:.3f}s last_sync_age={last_sync_age:.3f}s last_pair_dt={pair_dt} last_reused_depth_age={reused_depth_age} last_rgb_gap={rgb_gap} last_depth_gap={depth_gap}',
+        )
 
     def publish_debug_image(self, rgb_image, response):
         if rgb_image is None:
@@ -421,6 +727,8 @@ class LimoManager(Node):
         self.homo_goal = homo_goal
 
     def move(self, vx, vy, vyaw, allow_turn_boost=True):
+        if stop_event.is_set() or not rclpy.ok():
+            return
         request = Twist()
         request.linear.x = vx
         request.linear.y = 0.0
@@ -442,7 +750,10 @@ class LimoManager(Node):
             self.last_turn_sign = 0
 
         request.angular.z = vyaw
-        self.control_pub.publish(request)
+        try:
+            self.control_pub.publish(request)
+        except Exception:
+            return
 
 
 if __name__ == '__main__':
@@ -461,6 +772,9 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         pass
     finally:
+        stop_event.set()
+        time.sleep(0.2)
         if manager is not None:
             manager.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()

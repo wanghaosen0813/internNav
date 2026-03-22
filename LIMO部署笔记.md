@@ -590,3 +590,133 @@ PC 端服务终端会输出明显的状态标志：
 ls test_data
 tail -f test_data/时间戳目录/server_runtime.log
 ```
+
+## 最新输入链路调整：参考 ApexNav 改客户端取图方式
+
+为解决“小车一启动客户端，相机话题就像被拖停”的问题，当前 `http_internvla_client.py` 已做如下调整：
+
+- 由 `ApproximateTimeSynchronizer` 改为分别订阅 RGB / Depth 最新帧
+- 默认优先使用压缩话题：
+  - `/camera/color/image_raw/compressed`
+  - `/camera/depth/image_raw/compressedDepth`
+- 增加“忙则丢帧”保护：上一帧还在处理时，不继续堆积新帧
+- 保留 `frame_process_interval`，让规划频率维持在低频
+
+### 当前判断
+
+这版改动的目标不是提升模型效果，而是先让：
+
+- 客户端启动后相机链路不再被明显拖住
+- `idx` 能持续增长
+- PC 端能连续收到多轮请求
+
+### 当前推荐运行方式
+
+```bash
+python http_internvla_client.py \
+  --server_url http://192.168.100.10:5801/eval_dual \
+  --instruction "The chair is in front of you. Move toward the chair and stop near it." \
+  --frame_process_interval 0.3 \
+  --sync_slop 0.3
+```
+
+
+
+## 2026-03-22 最新稳定复现结论
+
+### 当前最关键的稳定条件
+
+这轮实测后，当前最重要的可复现条件已经明确：
+
+- 小车端所有 ROS2 终端统一使用纯 Foxy 干净 shell：`bash --noprofile --norc`
+- 小车端统一设置：`export ROS_LOCALHOST_ONLY=1`
+- 小车 WiFi 关闭，避免 DDS 误选 `wlan0 + IPv6`
+- Orbbec 相机必须降负载运行，不能继续使用默认的 `color/depth/ir 30 FPS`
+- 客户端当前必须使用 raw 话题，不使用 compressed 话题
+- 客户端增加了 `recent depth` 兜底，depth 短时断流时不会立刻停住
+
+### 已验证有效的相机低负载启动方式
+
+当前实测有效的相机启动参数是：
+
+```bash
+bash --noprofile --norc
+export ROS_LOCALHOST_ONLY=1
+source /opt/ros/foxy/setup.bash
+ros2 launch orbbec_camera dabai.launch.py \
+  enable_ir:=false \
+  enable_point_cloud:=false \
+  enable_colored_point_cloud:=false \
+  enable_d2c_viewer:=false \
+  color_fps:=15 \
+  depth_fps:=15
+```
+
+从启动日志确认，这组参数已经成功生效：
+
+- `Stream color ... fps: 15`
+- `Stream depth ... fps: 15`
+- 不再启用 `IR stream`
+
+说明：
+
+- `enable_frame_sync` 不能在运行时动态切换
+- 当前 `dabai.launch.py` 没有把它暴露为 launch 参数
+- 所以本轮复现中不依赖 `frame_sync`，先靠降负载 + 客户端兜底稳定运行
+
+### 当前客户端的稳定启动参数
+
+当前实测有效的小车端客户端启动命令：
+
+```bash
+bash --noprofile --norc
+export ROS_LOCALHOST_ONLY=1
+source /opt/ros/foxy/setup.bash
+source ~/venvs/internnav_limo/bin/activate
+cd /home/agilex/InternNav/realworld
+python http_internvla_client.py \
+  --server_url http://192.168.100.10:5801/eval_dual \
+  --instruction "The chair is in front of you. Move toward the chair and stop near it." \
+  --no-use_compressed_rgb \
+  --no-use_compressed_depth \
+  --rgb_topic /camera/color/image_raw \
+  --depth_topic /camera/depth/image_raw \
+  --sync_queue_size 10 \
+  --sync_slop 0.3 \
+  --frame_process_interval 0.3 \
+  --reuse_depth_max_age 1.0
+```
+
+### 这一轮日志验证到的关键现象
+
+最新有效运行目录：
+
+- `test_data/20260322_210205`
+
+从日志确认：
+
+- `idx` 已经可以持续增长到 `29`
+- 服务端持续输出 `[FOUND_CHAIR_CANDIDATE]` 和 `[TRACKING_TARGET]`
+- `depth_count` 已经不再像之前那样很快停在 `4/7/8`
+- 客户端确实触发了 `recent depth` 兜底：
+  - `Reusing recent depth. reuse_count=...`
+
+这说明当前系统已经从“容易卡死”进展到“可以持续运动并持续跟踪目标”。
+
+### 当前仍然存在的问题
+
+虽然整条链路已经明显稳定很多，但当前还没有完全根治 depth 流问题：
+
+- depth 仍然存在偶发短时断流
+- 目前依靠 `recent depth` 复用来平滑兜底
+- 所以当前版本可以用于继续实验和复现，但仍建议后续继续优化相机侧稳定性
+
+### 当前判断标准
+
+如果下次复现实验时满足以下现象，说明链路已经回到当前稳定状态：
+
+- `ros2 topic list` 能正常列出相机、里程计和控制话题
+- 客户端能持续打印 `idx: 0, 1, 2, ...`
+- `client_runtime.log` 里的 `depth_count` 持续增长
+- `server_runtime.log` 里持续出现 `[TRACKING_TARGET]`
+- 小车能够持续向前靠近，而不是一两帧后立刻停住

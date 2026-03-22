@@ -464,3 +464,224 @@ PC 端服务终端会输出明显的状态标志：
 ls test_data
 tail -f test_data/时间戳目录/server_runtime.log
 ```
+
+## 客户端取图链路更新（压缩图像优先）
+
+当前小车端客户端已改为更接近 ApexNav 的实机风格：
+
+- 默认优先订阅压缩彩色图：`/camera/color/image_raw/compressed`
+- 默认优先订阅压缩深度图：`/camera/depth/image_raw/compressedDepth`
+- 不再严格依赖 `ApproximateTimeSynchronizer`
+- 改为分别缓存最新 RGB / Depth 帧，再按时间差和低频间隔处理
+- 如果上一帧仍在处理，则直接跳过新帧，相当于“忙则丢帧”
+
+### 新的推荐启动命令
+
+```bash
+python http_internvla_client.py \
+  --server_url http://192.168.100.10:5801/eval_dual \
+  --instruction "The chair is in front of you. Move toward the chair and stop near it." \
+  --frame_process_interval 0.3 \
+  --sync_slop 0.3
+```
+
+### 如需切回原始 raw 话题
+
+```bash
+python http_internvla_client.py \
+  --server_url http://192.168.100.10:5801/eval_dual \
+  --instruction "The chair is in front of you. Move toward the chair and stop near it." \
+  --no-use_compressed_rgb \
+  --no-use_compressed_depth \
+  --rgb_topic /camera/color/image_raw \
+  --depth_topic /camera/depth/image_raw
+```
+
+
+
+## 当前推荐的小车端纯净环境
+
+小车端所有 ROS2 终端统一使用下面这套方式启动：
+
+```bash
+bash --noprofile --norc
+export ROS_LOCALHOST_ONLY=1
+source /opt/ros/foxy/setup.bash
+```
+
+说明：
+
+- 这样可以避免 DDS 误选 `wlan0 + IPv6`
+- 小车端 WiFi 建议保持关闭
+- 小车端 ROS2 节点只做本机通信，PC 与小车之间走 HTTP，不走跨机 ROS2
+
+## 当前相机推荐启动命令
+
+不要再使用默认的 `dabai.launch.py` 无参启动。当前推荐使用低负载模式：
+
+```bash
+bash --noprofile --norc
+export ROS_LOCALHOST_ONLY=1
+source /opt/ros/foxy/setup.bash
+ros2 launch orbbec_camera dabai.launch.py \
+  enable_ir:=false \
+  enable_point_cloud:=false \
+  enable_colored_point_cloud:=false \
+  enable_d2c_viewer:=false \
+  color_fps:=15 \
+  depth_fps:=15
+```
+
+当前这组参数已经验证会生效：
+
+- color = `15 FPS`
+- depth = `15 FPS`
+- `IR` 关闭
+
+## 当前推荐的小车端客户端启动命令
+
+```bash
+bash --noprofile --norc
+export ROS_LOCALHOST_ONLY=1
+source /opt/ros/foxy/setup.bash
+source ~/venvs/internnav_limo/bin/activate
+cd /home/agilex/InternNav/realworld
+python http_internvla_client.py \
+  --server_url http://192.168.100.10:5801/eval_dual \
+  --instruction "The chair is in front of you. Move toward the chair and stop near it." \
+  --no-use_compressed_rgb \
+  --no-use_compressed_depth \
+  --rgb_topic /camera/color/image_raw \
+  --depth_topic /camera/depth/image_raw \
+  --sync_queue_size 10 \
+  --sync_slop 0.3 \
+  --frame_process_interval 0.3 \
+  --reuse_depth_max_age 1.0
+```
+
+参数含义：
+
+- `--no-use_compressed_rgb` / `--no-use_compressed_depth`
+  - 当前 Orbbec 实测先用 raw 话题更稳
+- `--sync_queue_size 10`
+  - 使用近似时间同步时保留小缓冲
+- `--sync_slop 0.3`
+  - RGB/Depth 最大允许时间差 `0.3s`
+- `--frame_process_interval 0.3`
+  - 客户端低频处理，减轻小车端负担
+- `--reuse_depth_max_age 1.0`
+  - depth 短时断流时，允许复用最近 1 秒内的有效 depth，避免立刻停住
+
+## 当前完整复现顺序
+
+### 1. PC 端启动推理服务
+
+```bash
+source /home/whs/anaconda3/etc/profile.d/conda.sh
+conda activate internnav
+cd /home/whs/wanghaosen/code/InternNav
+TOKENIZERS_PARALLELISM=false python scripts/realworld/http_internvla_server.py \
+  --device cuda:0 \
+  --model_path checkpoints/InternVLA-N1 \
+  --resize_w 384 \
+  --resize_h 384 \
+  --num_history 8 \
+  --plan_step_gap 4
+```
+
+### 2. 小车端启动底盘
+
+```bash
+bash --noprofile --norc
+export ROS_LOCALHOST_ONLY=1
+source /opt/ros/foxy/setup.bash
+ros2 launch limo_base limo_base.launch.py
+```
+
+### 3. 小车端启动相机
+
+```bash
+bash --noprofile --norc
+export ROS_LOCALHOST_ONLY=1
+source /opt/ros/foxy/setup.bash
+ros2 launch orbbec_camera dabai.launch.py \
+  enable_ir:=false \
+  enable_point_cloud:=false \
+  enable_colored_point_cloud:=false \
+  enable_d2c_viewer:=false \
+  color_fps:=15 \
+  depth_fps:=15
+```
+
+### 4. 小车端确认关键话题
+
+```bash
+bash --noprofile --norc
+export ROS_LOCALHOST_ONLY=1
+source /opt/ros/foxy/setup.bash
+ros2 topic list
+```
+
+至少应看到：
+
+- `/camera/color/image_raw`
+- `/camera/depth/image_raw`
+- `/odom`
+- `/cmd_vel`
+
+### 5. 小车端启动客户端
+
+```bash
+bash --noprofile --norc
+export ROS_LOCALHOST_ONLY=1
+source /opt/ros/foxy/setup.bash
+source ~/venvs/internnav_limo/bin/activate
+cd /home/agilex/InternNav/realworld
+python http_internvla_client.py \
+  --server_url http://192.168.100.10:5801/eval_dual \
+  --instruction "The chair is in front of you. Move toward the chair and stop near it." \
+  --no-use_compressed_rgb \
+  --no-use_compressed_depth \
+  --rgb_topic /camera/color/image_raw \
+  --depth_topic /camera/depth/image_raw \
+  --sync_queue_size 10 \
+  --sync_slop 0.3 \
+  --frame_process_interval 0.3 \
+  --reuse_depth_max_age 1.0
+```
+
+## 当前推荐验收标准
+
+这轮最新稳定版本建议用下面几条验收：
+
+- 客户端终端里 `idx` 持续增长，不停在 `0/1/4`
+- `client_runtime.log` 中 `depth_count` 持续增长
+- `client_runtime.log` 中即使出现 `Reusing recent depth ...`，系统也仍继续推进
+- `server_runtime.log` 持续出现 `[TRACKING_TARGET]`
+- 小车能持续向前靠近，而不是只动一下就停
+
+## 当前日志位置
+
+PC 端日志统一保存到：
+
+- `/home/whs/wanghaosen/code/InternNav/test_data/<timestamp>/client_runtime.log`
+- `/home/whs/wanghaosen/code/InternNav/test_data/<timestamp>/server_runtime.log`
+
+查看最新一轮：
+
+```bash
+cd /home/whs/wanghaosen/code/InternNav/test_data
+ls -1dt * | head
+```
+
+跟踪最新客户端日志：
+
+```bash
+tail -f /home/whs/wanghaosen/code/InternNav/test_data/最新目录/client_runtime.log
+```
+
+跟踪最新服务端日志：
+
+```bash
+tail -f /home/whs/wanghaosen/code/InternNav/test_data/最新目录/server_runtime.log
+```

@@ -23,6 +23,7 @@ DEFAULT_INSTRUCTION = (
     "go inside the open door. Stop at the computer monitor"
 )
 run_log_path = ''
+client_run_log_path = ''
 last_state = None
 
 
@@ -67,6 +68,16 @@ def log_server_event(message):
             f.write(formatted + '\n')
 
 
+def log_client_event(message):
+    global client_run_log_path
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    formatted = f'[{timestamp}] {message}'
+    print(formatted)
+    if client_run_log_path:
+        with open(client_run_log_path, 'a', encoding='utf-8') as f:
+            f.write(formatted + '\n')
+
+
 def log_server_state(json_output):
     global last_state
     state = classify_json_output(json_output)
@@ -78,9 +89,22 @@ def log_server_state(json_output):
     log_server_event(summary)
 
 
+@app.route("/client_log", methods=['POST'])
+def client_log():
+    global client_run_log_path
+    payload = request.get_json(silent=True) or {}
+    message = payload.get('message')
+    if not message:
+        return jsonify({'status': 'ignored'}), 400
+    if not client_run_log_path:
+        client_run_log_path = os.path.join(agent.save_dir, 'client_runtime.log')
+    log_client_event(message)
+    return jsonify({'status': 'ok'})
+
+
 @app.route("/eval_dual", methods=['POST'])
 def eval_dual():
-    global idx, output_dir, start_time, run_log_path, last_state
+    global idx, output_dir, start_time, run_log_path, client_run_log_path, last_state
     start_time = time.time()
 
     image_file = request.files['image']
@@ -109,12 +133,17 @@ def eval_dual():
         print("init reset model!!!")
         agent.reset()
         run_log_path = os.path.join(agent.save_dir, 'server_runtime.log')
+        client_run_log_path = os.path.join(agent.save_dir, 'client_runtime.log')
         last_state = None
         log_server_event(f'[START] instruction={instruction}')
         log_server_event(f'[START] runtime_log={run_log_path}')
+        log_client_event(f'[START] runtime_log={client_run_log_path}')
 
     if not run_log_path:
         run_log_path = os.path.join(agent.save_dir, 'server_runtime.log')
+    if not client_run_log_path:
+        client_run_log_path = os.path.join(agent.save_dir, 'client_runtime.log')
+        client_run_log_path = os.path.join(agent.save_dir, 'client_runtime.log')
 
     idx += 1
 
