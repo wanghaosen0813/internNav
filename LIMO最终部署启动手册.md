@@ -639,7 +639,7 @@ source ~/venvs/internnav_limo/bin/activate
 cd /home/agilex/InternNav/realworld
 python http_internvla_client.py \
   --server_url http://192.168.100.10:5801/eval_dual \
-  --instruction "The chair is in front of you. Move toward the chair and stop near it." \
+  --instruction "Keep the chair centered in view. Stop directly in front of the chair, not beside it." \
   --no-use_compressed_rgb \
   --no-use_compressed_depth \
   --rgb_topic /camera/color/image_raw \
@@ -649,6 +649,12 @@ python http_internvla_client.py \
   --frame_process_interval 0.3 \
   --reuse_depth_max_age 1.0
 ```
+
+Keep the chair centered in view. Stop directly in front of the chair, not beside it.
+The chair is in front of you. Move toward the chair and stop near it.
+The chair is in front of you. Walk straight toward the chair and stop directly in front of it, facing the chair.
+
+
 
 ## 当前推荐验收标准
 

@@ -98,25 +98,30 @@ def post_client_log(url, message):
         pass
 
 
-def _sample_topic_hz(topic, duration, client_log_url):
+def _run_topic_command(label, cmd, topic, duration, client_log_url):
     try:
-        result = subprocess.run(
-            ['ros2', 'topic', 'hz', '--window', '50', topic],
-            capture_output=True, text=True, timeout=duration,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=duration)
         output = (result.stdout or result.stderr).strip()
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or '').strip()
+        output = ((exc.stdout or '') + '\n' + (exc.stderr or '')).strip()
     except Exception as exc:
         output = f'error: {exc}'
-    post_client_log(client_log_url, f'[topic_hz] {topic}: {output}')
+    if not output:
+        output = '<no output>'
+    post_client_log(client_log_url, f'[{label}] {topic}: {output}')
 
 
-def start_topic_hz_logging(rgb_topic, depth_topic, client_log_url, duration=10):
-    for topic in (rgb_topic, depth_topic):
+def start_topic_diagnostics_logging(rgb_topic, depth_topic, client_log_url, duration=10):
+    diagnostics = [
+        ('topic_hz', ['ros2', 'topic', 'hz', '--window', '50', rgb_topic], rgb_topic, duration),
+        ('topic_hz', ['ros2', 'topic', 'hz', '--window', '50', depth_topic], depth_topic, duration),
+        ('topic_info', ['ros2', 'topic', 'info', rgb_topic, '-v'], rgb_topic, 5),
+        ('topic_echo', ['ros2', 'topic', 'echo', rgb_topic, '--once'], rgb_topic, 5),
+    ]
+    for label, cmd, topic, timeout_sec in diagnostics:
         threading.Thread(
-            target=_sample_topic_hz,
-            args=(topic, duration, client_log_url),
+            target=_run_topic_command,
+            args=(label, cmd, topic, timeout_sec, client_log_url),
             daemon=True,
         ).start()
 
@@ -404,7 +409,7 @@ class LimoManager(Node):
         self.get_logger().info(f'Frame pair queue size: {self.frame_pair_queue_size}')
         self.emit_client_log(f'Frame pair queue size: {self.frame_pair_queue_size}')
 
-        start_topic_hz_logging(self.rgb_topic, self.depth_topic, self.client_log_url, duration=10)
+        start_topic_diagnostics_logging(self.rgb_topic, self.depth_topic, self.client_log_url, duration=10)
 
     @staticmethod
     def _stamp_to_sec(stamp):
