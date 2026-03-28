@@ -29,8 +29,10 @@ DEFAULT_IMAGE_TOKEN = "<image>"
 class InternVLAN1AsyncAgent:
     def __init__(self, args):
         self.device = torch.device(args.device)
-        self.save_dir = "test_data/" + datetime.now().strftime("%Y%m%d_%H%M%S")
-        os.makedirs(self.save_dir, exist_ok=True)
+        self.save_dir = os.path.join("test_data", datetime.now().strftime("%Y%m%d_%H%M%S"))
+        self.images_dir = None
+        self.llm_output_path = None
+        self._init_save_layout()
         print(f"args.model_path{args.model_path}")
         config = InternVLAN1ModelConfig.from_pretrained(args.model_path)
         if not hasattr(config, 'system1'):
@@ -112,8 +114,29 @@ class InternVLAN1AsyncAgent:
         self.pixel_goal_rgb = None
         self.pixel_goal_depth = None
 
-        self.save_dir = "test_data/" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.save_dir = os.path.join("test_data", datetime.now().strftime("%Y%m%d_%H%M%S"))
+        self._init_save_layout()
+
+    def _init_save_layout(self):
         os.makedirs(self.save_dir, exist_ok=True)
+        self.images_dir = os.path.join(self.save_dir, "images")
+        os.makedirs(self.images_dir, exist_ok=True)
+        self.llm_output_path = os.path.join(self.save_dir, "llm_output.txt")
+
+    @staticmethod
+    def _step_tag(step_idx):
+        return f"{step_idx:04d}"
+
+    def _save_debug_image(self, image, step_idx, look_down=False):
+        suffix = "_look_down" if look_down else ""
+        image_path = os.path.join(self.images_dir, f"debug_raw_{self._step_tag(step_idx)}{suffix}.jpg")
+        image.save(image_path)
+
+    def _append_llm_output(self, step_idx, llm_output, look_down=False):
+        mode = "look_down" if look_down else "main"
+        with open(self.llm_output_path, "a", encoding="utf-8") as f:
+            f.write(f"===== step {self._step_tag(step_idx)} [{mode}] =====\n")
+            f.write(f"{llm_output}\n\n")
 
     def parse_actions(self, output):
         action_patterns = '|'.join(re.escape(action) for action in self.actions2idx)
@@ -127,7 +150,7 @@ class InternVLAN1AsyncAgent:
         image = Image.fromarray(rgb).convert('RGB')
         image = image.resize((self.resize_w, self.resize_h))
         self.rgb_list.append(image)
-        image.save(f"{self.save_dir}/debug_raw_{self.episode_idx: 04d}.jpg")
+        self._save_debug_image(image, self.episode_idx)
         self.episode_idx += 1
 
     def trajectory_tovw(self, trajectory, kp=1.0):
@@ -178,12 +201,13 @@ class InternVLAN1AsyncAgent:
 
     def step_s2(self, rgb, depth, pose, instruction, intrinsic, look_down=False):
         image = Image.fromarray(rgb).convert('RGB')
+        step_idx = self.episode_idx
         if not look_down:
             image = image.resize((self.resize_w, self.resize_h))
             self.rgb_list.append(image)
-            image.save(f"{self.save_dir}/debug_raw_{self.episode_idx: 04d}.jpg")
+            self._save_debug_image(image, step_idx)
         else:
-            image.save(f"{self.save_dir}/debug_raw_{self.episode_idx: 04d}_look_down.jpg")
+            self._save_debug_image(image, step_idx, look_down=True)
         if not look_down:
             self.conversation_history = []
             self.past_key_values = None
@@ -246,8 +270,7 @@ class InternVLAN1AsyncAgent:
         self.llm_output = self.processor.tokenizer.decode(
             output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
         )
-        with open(f"{self.save_dir}/llm_output_{self.episode_idx: 04d}.txt", 'w') as f:
-            f.write(self.llm_output)
+        self._append_llm_output(step_idx, self.llm_output, look_down=look_down)
         self.last_output_ids = copy.deepcopy(output_ids[0])
         self.past_key_values = copy.deepcopy(outputs.past_key_values)
         print(f"output {self.episode_idx}  {self.llm_output} cost: {t1 - t0}s")

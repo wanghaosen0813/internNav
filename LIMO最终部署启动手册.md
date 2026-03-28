@@ -548,15 +548,18 @@ source ~/venvs/internnav_limo/bin/activate
 cd /home/agilex/InternNav/realworld
 python http_internvla_client.py \
   --server_url http://192.168.100.10:5801/eval_dual \
-  --instruction "The chair is in front of you. Move toward the chair and stop near it." \
+  --instruction "There is a chair in front of you. First, slowly rotate in place to find the chair. After you find it, keep the chair centered in view. Then move forward toward the chair and stop at close range directly in front of it" \
   --no-use_compressed_rgb \
   --no-use_compressed_depth \
   --rgb_topic /camera/color/image_raw \
   --depth_topic /camera/depth/image_raw \
   --sync_queue_size 10 \
-  --sync_slop 0.3 \
-  --frame_process_interval 0.3 \
-  --reuse_depth_max_age 1.0
+  --sync_slop 0.1 \
+  --frame_process_interval 0.2 \
+  --reuse_depth_max_age 0.2 \
+  --turn_in_place_omega 0.25 \
+  --turn_in_place_angular_deadband 0.05 \
+  --turn_direction_hold_sec 0.3
 ```
 
 参数含义：
@@ -639,23 +642,47 @@ source ~/venvs/internnav_limo/bin/activate
 cd /home/agilex/InternNav/realworld
 python http_internvla_client.py \
   --server_url http://192.168.100.10:5801/eval_dual \
-  --instruction "Keep the chair centered in view. Stop directly in front of the chair, not beside it." \
+  --instruction "There is a chair in front of you. First, slowly rotate in place to find the chair. After you find it, keep the chair centered in view. Then move forward toward the chair and stop at close range directly in front of it" \
   --no-use_compressed_rgb \
   --no-use_compressed_depth \
   --rgb_topic /camera/color/image_raw \
   --depth_topic /camera/depth/image_raw \
   --sync_queue_size 10 \
-  --sync_slop 0.3 \
-  --frame_process_interval 0.3 \
-  --reuse_depth_max_age 1.0
+  --sync_slop 0.1 \
+  --frame_process_interval 0.2 \
+  --reuse_depth_max_age 0.2 \
+  --turn_in_place_omega 0.25 \
+  --turn_in_place_angular_deadband 0.05 \
+  --turn_direction_hold_sec 0.3
 ```
 
-Keep the chair centered in view. Stop directly in front of the chair, not beside it.
-The chair is in front of you. Move toward the chair and stop near it.
-The chair is in front of you. Walk straight toward the chair and stop directly in front of it, facing the chair.
+
+bash --noprofile --norc
+export ROS_LOCALHOST_ONLY=1
+source /opt/ros/foxy/setup.bash
+source ~/venvs/internnav_limo/bin/activate
+cd /home/agilex/InternNav/realworld
+python http_internvla_client.py \
+  --server_url http://192.168.1.35:5801/eval_dual \
+  --instruction "There is a chair in front of you. First, slowly rotate in place to find the chair. After you find it, keep the chair centered in view. Then move forward toward the chair and stop at close range directly in front of it" \
+  --no-use_compressed_rgb \
+  --no-use_compressed_depth \
+  --rgb_topic /camera/color/image_raw \
+  --depth_topic /camera/depth/image_raw \
+  --sync_queue_size 10 \
+  --sync_slop 0.1 \
+  --frame_process_interval 0.2 \
+  --reuse_depth_max_age 0.2 \
+  --turn_in_place_omega 0.25 \
+  --turn_in_place_angular_deadband 0.05 \
+  --turn_direction_hold_sec 0.3
 
 
 
+
+
+
+There is a chair in front of you. First, slowly rotate in place to find the chair. After you find it, keep the chair centered in view. Then move forward toward the chair and stop at close range directly in front of it.
 ## 当前推荐验收标准
 
 这轮最新稳定版本建议用下面几条验收：
